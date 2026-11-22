@@ -7,9 +7,11 @@
 //! `zgx` theme, material, and locale state as the main GUI.
 
 use std::cell::{Cell, RefCell};
+use std::net::{SocketAddr, TcpStream};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows_sys::Win32::Globalization::GetUserDefaultUILanguage;
@@ -18,17 +20,21 @@ use windows_sys::Win32::Graphics::Gdi::{
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Shell::{
-    NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, Shell_NotifyIconW,
+    DefSubclassProc, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
+    RemoveWindowSubclass, SetWindowSubclass, Shell_NotifyIconW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, FindWindowW, GWL_EXSTYLE,
-    GWLP_USERDATA, GetCursorPos, GetMessageW, GetWindowLongPtrW, GetWindowThreadProcessId, HICON,
-    IDI_APPLICATION, IMAGE_ICON, LR_DEFAULTSIZE, LR_SHARED, LoadIconW, LoadImageW, MSG,
-    PostMessageW, PostQuitMessage, RegisterClassExW, RegisterWindowMessageW, SetForegroundWindow,
-    SetWindowLongPtrW, SetWindowPos, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-    SWP_NOZORDER, TranslateMessage, WM_APP, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY, WM_ENDSESSION,
-    WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_RBUTTONUP, WNDCLASSEXW, WS_EX_APPWINDOW,
-    WS_EX_TOOLWINDOW, WS_OVERLAPPED,
+    GWL_STYLE, GWLP_USERDATA, GetCursorPos, GetForegroundWindow, GetMessageW, GetWindowLongPtrW,
+    GetWindowThreadProcessId, HICON, IDI_APPLICATION, IMAGE_ICON, IsWindowVisible, LR_DEFAULTSIZE,
+    LR_SHARED, LoadIconW, LoadImageW, MSG, PostMessageW, PostQuitMessage, RegisterClassExW,
+    RegisterWindowMessageW, STYLESTRUCT, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    SWP_NOZORDER, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, TranslateMessage,
+    WA_INACTIVE, WM_ACTIVATE, WM_APP, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY, WM_ENDSESSION,
+    WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_NCDESTROY, WM_RBUTTONUP, WM_STYLECHANGING, WNDCLASSEXW,
+    WS_BORDER, WS_CAPTION, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_EX_WINDOWEDGE, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_POPUP,
+    WS_SYSMENU, WS_THICKFRAME,
 };
 use zgx::compose::{button, column, component, div, row, svg, switch, text};
 use zgx::cursor::Cursor;
@@ -49,7 +55,8 @@ const WM_TRAY: u32 = WM_APP + 1;
 const LANG_CHINESE_PRIMARY: u16 = 0x04;
 
 const MENU_TITLE: &str = "ZeronTrayMenu";
-const MENU_WIDTH: f64 = 196.0;
+const MENU_SUBCLASS_ID: usize = 0x5a54_524d; // "ZTRM"
+const MENU_WIDTH: f64 = 180.0;
 // 1 (top border) + 4 (pad) + 22 (brand) + 2 (gap) + 28 (Show) + 4 (pad)
 // + 1 (rule) + 4 (pad) + 28 (Quit) + 4 (pad) + 1 (bottom border) = 99
 const MENU_HEIGHT: f64 = 99.0;
@@ -57,11 +64,11 @@ const EDGE_MARGIN: f64 = 8.0;
 const CURSOR_GAP: f64 = 6.0;
 
 const LOGO_SVG: &str = include_str!("../ui/assets/icons/ui/zeron-logo.svg");
-const SHOW_SVG: &str = include_str!("../ui/assets/icons/ui/monitor.svg");
-const QUIT_SVG: &str = include_str!("../ui/assets/icons/ui/close-circle.svg");
 
 static MAIN_WINDOW: Mutex<Option<WindowHandle>> = Mutex::new(None);
 static MENU_WINDOW: Mutex<Option<WindowHandle>> = Mutex::new(None);
+static MENU_HWND: AtomicUsize = AtomicUsize::new(0);
+static STOP_ENGINE_ON_QUIT: AtomicBool = AtomicBool::new(false);
 
 struct TrayState {
     nid: NOTIFYICONDATAW,
@@ -78,7 +85,6 @@ struct TrayPalette {
     border: Color,
     rule: Color,
     text_primary: Color,
-    text_secondary: Color,
     text_tertiary: Color,
     hover: Color,
     pressed: Color,
@@ -149,15 +155,6 @@ impl TrayPalette {
                 Color(0x1b, 0x1b, 0x1d, 0xff)
             },
         );
-        let text_secondary = tok_color(
-            root,
-            "text.secondary",
-            if dark {
-                Color(0xed, 0xed, 0xef, 153)
-            } else {
-                Color(0x1b, 0x1b, 0x1d, 163)
-            },
-        );
         let text_tertiary = tok_color(
             root,
             "text.tertiary",
@@ -208,7 +205,6 @@ impl TrayPalette {
             border,
             rule,
             text_primary,
-            text_secondary,
             text_tertiary,
             hover,
             pressed,
@@ -277,6 +273,52 @@ fn restore(handle: &WindowHandle) {
     handle.request_focus();
 }
 
+fn request_full_quit(close_main: &WindowHandle, quit_app: &WindowFactory) {
+    STOP_ENGINE_ON_QUIT.store(true, Ordering::SeqCst);
+    hide_menu();
+    // Close the main window first so `on_closed` saves state and
+    // tears down the tray icon and menu window before exiting.
+    close_main.close();
+    quit_app.quit();
+}
+
+/// Returns whether quitting was initiated from the tray (or OS session end),
+/// clearing the flag so subsequent queries return `false`.
+pub fn take_stop_engine_on_quit() -> bool {
+    STOP_ENGINE_ON_QUIT.swap(false, Ordering::SeqCst)
+}
+
+/// Ask the managed background engine to stop and wait briefly until its local
+/// IPC port stops accepting connections.
+pub fn stop_engine() {
+    let Some((port, data_dir)) = crate::engine::get().ipc_endpoint() else {
+        return;
+    };
+    if let Err(error) = crate::engine::rpc::call_blocking(
+        port,
+        &data_dir,
+        "StopEngine",
+        serde_json::json!({}),
+        Duration::from_secs(5),
+    ) {
+        if error != "offline" {
+            eprintln!("zeron-zgx: quit: couldn't stop the engine ({error})");
+        }
+        return;
+    }
+    // `StopEngine` replies first, then waits 500 ms before triggering shutdown.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    std::thread::sleep(Duration::from_millis(550));
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    while Instant::now() < deadline {
+        if TcpStream::connect_timeout(&addr, Duration::from_millis(50)).is_err() {
+            std::thread::sleep(Duration::from_millis(150));
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 /// Install close-to-tray behavior, the tray icon, and the Zeron-styled tray
 /// context menu window for the main window.
 pub fn install(cx: &mut WindowContext, locale: Signal<Value>) {
@@ -300,10 +342,7 @@ pub fn install(cx: &mut WindowContext, locale: Signal<Value>) {
     let quit_app = cx.windows.clone();
     cx.tasks.spawn(async move {
         if quit_rx.recv().await.is_some() {
-            // Close the main window first so `on_closed` saves state and
-            // tears down the tray icon and menu window before exiting.
-            close_main.close();
-            quit_app.quit();
+            request_full_quit(&close_main, &quit_app);
         }
     });
 
@@ -337,7 +376,7 @@ pub fn install(cx: &mut WindowContext, locale: Signal<Value>) {
     cx.tasks.spawn(async move {
         while let Some((x, y)) = menu_rx.recv().await {
             let handle = open_on_click();
-            apply_tool_window_style();
+            install_menu_subclass();
             let work = work_area_at(x, y);
             let scale = scale_at(&displays, x, y);
             let bounds = place_menu((x, y), work, scale);
@@ -406,7 +445,7 @@ fn open_menu_window(
         titlebar: Titlebar::Hidden,
         glass: Some(Glass::new(GlassMaterial::UnderWindowBackground).plain()),
         level: WindowLevel::AlwaysOnTop,
-        shadow: true,
+        shadow: false,
         visible: false,
         ..Default::default()
     };
@@ -419,23 +458,18 @@ fn open_menu_window(
             hide_on_close.set_visible(false);
             false
         });
-        cx.on_closed(|| {
-            if let Ok(mut slot) = MENU_WINDOW.lock() {
-                *slot = None;
-            }
-        });
 
         let ready = cx.window_info.ready.clone();
-        cx.ui.runtime.effect(move || {
+        let ready_effect = cx.ui.runtime.effect(move || {
             if ready.get() {
-                apply_tool_window_style();
+                install_menu_subclass();
             }
         });
 
         let active = cx.ui.observe_window_active();
         let was_active = Rc::new(Cell::new(false));
         let hide_on_blur = cx.window.clone();
-        cx.ui.runtime.effect(move || {
+        let blur_effect = cx.ui.runtime.effect(move || {
             if active.get() {
                 was_active.set(true);
             } else if was_active.replace(false) {
@@ -447,7 +481,7 @@ fn open_menu_window(
         let sync_chrome_themes = themes.clone();
         let sync_chrome_window = cx.window.clone();
         let applied_chrome = Rc::new(Cell::new(None::<(bool, bool)>));
-        cx.ui.runtime.effect(move || {
+        let chrome_effect = cx.ui.runtime.effect(move || {
             let palette = TrayPalette::from_theme(&sync_chrome_themes);
             let next = (palette.dark, palette.frosted);
             if applied_chrome.get() != Some(next) {
@@ -462,6 +496,16 @@ fn open_menu_window(
                         .frosted
                         .then(|| Glass::new(GlassMaterial::UnderWindowBackground).plain()),
                 );
+            }
+        });
+
+        // Keep effect handles alive for the lifetime of the menu window.
+        let keep_effects = Rc::new(RefCell::new(vec![ready_effect, blur_effect, chrome_effect]));
+        cx.on_closed(move || {
+            keep_effects.borrow_mut().clear();
+            MENU_HWND.store(0, Ordering::SeqCst);
+            if let Ok(mut slot) = MENU_WINDOW.lock() {
+                *slot = None;
             }
         });
 
@@ -536,8 +580,6 @@ fn open_menu_window(
                                 )
                                 .child(menu_row(
                                     show_label,
-                                    SHOW_SVG,
-                                    palette.text_secondary,
                                     palette.text_primary,
                                     palette.hover,
                                     palette.pressed,
@@ -554,15 +596,11 @@ fn open_menu_window(
                                 .gap(2.)
                                 .child(menu_row(
                                     quit_label,
-                                    QUIT_SVG,
-                                    palette.danger,
                                     palette.danger,
                                     palette.danger_hover,
                                     palette.danger_pressed,
                                     move || {
-                                        hide_menu();
-                                        close_main.close();
-                                        quit_app.quit();
+                                        request_full_quit(&close_main, &quit_app);
                                     },
                                 )),
                         )
@@ -581,8 +619,6 @@ fn tinted_svg(label: &str, source: &'static str, size: f32, color: Color) -> zgx
 
 fn menu_row(
     label: &'static str,
-    icon_svg: &'static str,
-    icon_color: Color,
     text_color: Color,
     hover_bg: Color,
     pressed_bg: Color,
@@ -593,7 +629,6 @@ fn menu_row(
         .w_full()
         .h(28.)
         .px(8.)
-        .gap(8.)
         .items_center()
         .rounded(5.)
         .bg(Color(0, 0, 0, 0))
@@ -602,14 +637,6 @@ fn menu_row(
         .hover(move |s| s.bg(hover_bg))
         .active(move |s| s.bg(pressed_bg))
         .on_click(on_click)
-        .child(
-            div()
-                .size(18., 18.)
-                .shrink_0()
-                .items_center()
-                .justify_center()
-                .child(tinted_svg("", icon_svg, 16., icon_color)),
-        )
         .child(
             text(label)
                 .font_family(FontFamily::from("Geist"))
@@ -620,10 +647,65 @@ fn menu_row(
         )
 }
 
-fn apply_tool_window_style() {
+fn normalize_menu_style(style: u32) -> u32 {
+    (style
+        & !(WS_CAPTION
+            | WS_SYSMENU
+            | WS_THICKFRAME
+            | WS_MINIMIZEBOX
+            | WS_MAXIMIZEBOX
+            | WS_BORDER))
+        | WS_POPUP
+        | WS_CLIPSIBLINGS
+        | WS_CLIPCHILDREN
+}
+
+fn normalize_menu_ex_style(ex_style: u32) -> u32 {
+    (ex_style | WS_EX_TOOLWINDOW | WS_EX_TOPMOST) & !(WS_EX_APPWINDOW | WS_EX_WINDOWEDGE)
+}
+
+unsafe extern "system" fn menu_subclass(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _id: usize,
+    _data: usize,
+) -> LRESULT {
+    match msg {
+        WM_STYLECHANGING if lparam != 0 => {
+            // SAFETY: Win32 passes a writable `STYLESTRUCT` pointer in `lparam` for `WM_STYLECHANGING`.
+            let ss = unsafe { &mut *(lparam as *mut STYLESTRUCT) };
+            match wparam as i32 {
+                GWL_STYLE => ss.styleNew = normalize_menu_style(ss.styleNew),
+                GWL_EXSTYLE => ss.styleNew = normalize_menu_ex_style(ss.styleNew),
+                _ => {}
+            }
+        }
+        WM_ACTIVATE => {
+            // SAFETY: queries visibility of the subclassed tray menu HWND on the UI thread.
+            if (wparam & 0xffff) as u32 == WA_INACTIVE && unsafe { IsWindowVisible(hwnd) } != 0 {
+                hide_menu();
+            }
+        }
+        WM_NCDESTROY => {
+            MENU_HWND.store(0, Ordering::SeqCst);
+            // SAFETY: removes this subclass as the tray menu HWND is destroyed.
+            unsafe {
+                let _ = RemoveWindowSubclass(hwnd, Some(menu_subclass), MENU_SUBCLASS_ID);
+            }
+        }
+        _ => {}
+    }
+    // SAFETY: forwards to the prior subclass/window procedure (`zgx` / `winit`).
+    unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
+}
+
+fn install_menu_subclass() {
     let title = wide(MENU_TITLE);
     // SAFETY: `title` is a NUL-terminated UTF-16 string; we verify the found
-    // window belongs to the current process before altering its extended style.
+    // window belongs to the current process before installing the subclass or
+    // normalizing its styles.
     unsafe {
         let hwnd = FindWindowW(std::ptr::null(), title.as_ptr());
         if hwnd.is_null() {
@@ -634,10 +716,24 @@ fn apply_tool_window_style() {
         if pid != std::process::id() {
             return;
         }
+        let raw = hwnd as usize;
+        if MENU_HWND.swap(raw, Ordering::SeqCst) != raw {
+            let _ = SetWindowSubclass(hwnd, Some(menu_subclass), MENU_SUBCLASS_ID, 0);
+        }
+        let style = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32;
+        let next_style = normalize_menu_style(style);
         let ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
-        let next = (ex_style | WS_EX_TOOLWINDOW) & !WS_EX_APPWINDOW;
-        if next != ex_style {
-            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, next as isize);
+        let next_ex_style = normalize_menu_ex_style(ex_style);
+        let mut changed = false;
+        if next_style != style {
+            SetWindowLongPtrW(hwnd, GWL_STYLE, next_style as isize);
+            changed = true;
+        }
+        if next_ex_style != ex_style {
+            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, next_ex_style as isize);
+            changed = true;
+        }
+        if changed {
             SetWindowPos(
                 hwnd,
                 std::ptr::null_mut(),
@@ -861,10 +957,14 @@ unsafe extern "system" fn wnd_proc(
                     WM_RBUTTONUP | WM_CONTEXTMENU => {
                         let mut pt = POINT { x: 0, y: 0 };
                         // SAFETY: `pt` is valid stack storage; `SetForegroundWindow` transfers
-                        // shell tray click foreground rights to this process for `request_focus`.
+                        // shell tray click foreground rights to this process unless the menu
+                        // itself is already foreground.
                         unsafe {
                             GetCursorPos(&mut pt);
-                            SetForegroundWindow(hwnd);
+                            let menu_hwnd = MENU_HWND.load(Ordering::SeqCst) as HWND;
+                            if menu_hwnd.is_null() || GetForegroundWindow() != menu_hwnd {
+                                SetForegroundWindow(hwnd);
+                            }
                         }
                         (state.open_menu)(pt.x, pt.y);
                     }
@@ -930,20 +1030,65 @@ mod tests {
     #[test]
     fn place_menu_bottom_right_taskbar_100_and_150_dpi() {
         let bounds_1x = place_menu((1850, 1056), (0, 0, 1920, 1032), 1.0);
-        assert_eq!(bounds_1x.size, (196, 99));
-        assert_eq!(bounds_1x.position, Some((1716, 925)));
+        assert_eq!(bounds_1x.size, (180, 99));
+        assert_eq!(bounds_1x.position, Some((1732, 925)));
 
         let bounds_15x = place_menu((2800, 1580), (0, 0, 2880, 1548), 1.5);
-        assert_eq!(bounds_15x.size, (294, 149));
-        assert_eq!(bounds_15x.position, Some((2574, 1387)));
+        assert_eq!(bounds_15x.size, (270, 149));
+        assert_eq!(bounds_15x.position, Some((2598, 1387)));
     }
 
     #[test]
     fn place_menu_top_taskbar_and_negative_monitor() {
         let top_bar = place_menu((1850, 24), (0, 48, 1920, 1080), 1.0);
-        assert_eq!(top_bar.position, Some((1716, 56)));
+        assert_eq!(top_bar.position, Some((1732, 56)));
 
         let neg_monitor = place_menu((-1800, 1050), (-1920, 0, 0, 1032), 1.0);
         assert_eq!(neg_monitor.position, Some((-1800, 925)));
+    }
+
+    #[test]
+    fn normalize_menu_style_strips_chrome_bits() {
+        use windows_sys::Win32::UI::WindowsAndMessaging::WS_VISIBLE;
+        let dirty = WS_VISIBLE
+            | WS_CAPTION
+            | WS_SYSMENU
+            | WS_THICKFRAME
+            | WS_MINIMIZEBOX
+            | WS_MAXIMIZEBOX
+            | WS_BORDER;
+        let clean = normalize_menu_style(dirty);
+        assert_eq!(
+            clean
+                & (WS_CAPTION
+                    | WS_SYSMENU
+                    | WS_THICKFRAME
+                    | WS_MINIMIZEBOX
+                    | WS_MAXIMIZEBOX
+                    | WS_BORDER),
+            0
+        );
+        assert_ne!(clean & WS_VISIBLE, 0);
+        assert_ne!(clean & WS_POPUP, 0);
+        assert_ne!(clean & WS_CLIPSIBLINGS, 0);
+        assert_ne!(clean & WS_CLIPCHILDREN, 0);
+    }
+
+    #[test]
+    fn normalize_menu_ex_style_sets_toolwindow_and_topmost() {
+        let dirty = WS_EX_APPWINDOW | WS_EX_WINDOWEDGE;
+        let clean = normalize_menu_ex_style(dirty);
+        assert_ne!(clean & WS_EX_TOOLWINDOW, 0);
+        assert_ne!(clean & WS_EX_TOPMOST, 0);
+        assert_eq!(clean & (WS_EX_APPWINDOW | WS_EX_WINDOWEDGE), 0);
+    }
+
+    #[test]
+    fn stop_engine_on_quit_flag_resets_on_take() {
+        STOP_ENGINE_ON_QUIT.store(false, Ordering::SeqCst);
+        assert!(!take_stop_engine_on_quit());
+        STOP_ENGINE_ON_QUIT.store(true, Ordering::SeqCst);
+        assert!(take_stop_engine_on_quit());
+        assert!(!take_stop_engine_on_quit());
     }
 }

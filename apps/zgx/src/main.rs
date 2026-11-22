@@ -384,10 +384,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             links::open(url);
         }
     })?;
-    // Quitting with "Keep Zeron running after you quit" off: the engine
-    // stops once its work is done, asking first about any still running
-    // (src/quit_prompt.rs). (Not for a relaunch: the app is coming back.)
+    // Quitting from the tray stops the background engine directly; other quits
+    // follow "Keep Zeron running after you quit" (src/quit_prompt.rs).
+    // (Not for a relaunch: the app is coming back.)
     if !relaunch::asked() {
+        #[cfg(windows)]
+        if windows_tray::take_stop_engine_on_quit() {
+            windows_tray::stop_engine();
+        } else {
+            quit_prompt::after_quit();
+        }
+        #[cfg(not(windows))]
         quit_prompt::after_quit();
     }
     // Quitting: an update downloaded and never restarted for installs now,
