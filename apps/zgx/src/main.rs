@@ -575,7 +575,8 @@ fn open_main(cx: &mut WindowContext, inspect: bool) {
     plugins::install(cx, &host);
     // The host's own toasts over it (a template in preview, a switch you
     // didn't make, signing keys, safe mode at launch).
-    let chrome = plugins::host_bar::view(cx, host.shared("zeron.locale", "en").signal());
+    let locale = host.shared("zeron.locale", "en").signal();
+    let chrome = plugins::host_bar::view(cx, locale.clone());
     // Where the app's toasts stand, over the host's (host_bar.rs `follow`).
     let floor = host.shared("toast_floor", 16.);
     let view = serve_with(cx, host, "app.luau", inspect, Some(chrome), menu_bar::Role::Bar);
@@ -585,7 +586,7 @@ fn open_main(cx: &mut WindowContext, inspect: bool) {
     // Launch's allocator peak handed back once it has settled (src/heap.rs).
     heap::install(cx);
     #[cfg(windows)]
-    windows_tray::install(cx);
+    windows_tray::install(cx, locale);
 }
 
 /// Where finishing setup on this Mac is remembered: a launch signed in
