@@ -1,0 +1,261 @@
+name: Fork Windows Release
+
+# Periodically checks zeronsh/zeron for new stable releases, merges them into
+# the `custom-tray` branch, builds the Windows installer + portable zip with
+# `zeron-update.json` pointing to this fork, and publishes a GitHub Release.
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Upstream release tag (e.g. v0.3.15); leave empty for latest stable
+        type: string
+        required: false
+        default: ''
+      force:
+        description: Rebuild even if this release already exists in this fork
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: fork-windows-release
+  cancel-in-progress: false
+
+jobs:
+  check:
+    if: github.repository != 'zeronsh/zeron'
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.plan.outputs.should_build }}
+      tag: ${{ steps.plan.outputs.tag }}
+      version: ${{ steps.plan.outputs.version }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: custom-tray
+          fetch-depth: 0
+
+      - name: Sync fork main branch with upstream (best effort)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api -X POST "repos/$GITHUB_REPOSITORY/merge-upstream" -f branch=main >/dev/null 2>&1 || true
+
+      - name: Resolve target upstream release and test merge
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.tag }}
+          FORCE_BUILD: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          tag="$INPUT_TAG"
+          if [ -z "$tag" ]; then
+            tag="$(gh api "repos/zeronsh/zeron/releases?per_page=30" --jq '[.[] | select(.draft == false and .prerelease == false and (.tag_name | test("^v[0-9]+\\.[0-9]+\\.[0-9]+$")))] | .[0].tag_name')"
+          fi
+          if [ -z "$tag" ] || [ "$tag" = "null" ] || [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid or missing upstream stable tag: '$tag'"
+            exit 1
+          fi
+          version="${tag#v}"
+          echo "Target upstream release: $tag ($version)"
+
+          if [ "$FORCE_BUILD" != "true" ]; then
+            assets="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets --jq '[.assets[].name]' 2>/dev/null || echo '[]')"
+            if jq -e --arg zip "zeron-$version-windows-x86_64.zip" 'index("manifest.json") != null and index($zip) != null' <<<"$assets" >/dev/null; then
+              echo "Fork release $tag already has manifest.json and zeron-$version-windows-x86_64.zip; skipping."
+              echo "should_build=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+
+          git fetch --no-tags https://github.com/zeronsh/zeron.git "refs/tags/$tag:refs/tags/$tag"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if ! git merge --no-edit "refs/tags/$tag"; then
+            conflicts="$(git diff --name-only --diff-filter=U | sed 's/^/- `/;s/$/`/')"
+            git merge --abort || true
+            title="[Auto-Sync] Merge conflict with upstream $tag"
+            body=$(cat <<EOF
+          Automated merge of upstream release \`$tag\` into \`custom-tray\` failed with conflicts.
+
+          ### Conflicted files
+          $conflicts
+
+          ### How to resolve locally
+          \`\`\`powershell
+          git fetch upstream main --tags
+          git checkout custom-tray
+          git merge $tag
+          # resolve conflicts, then push
+          git push origin custom-tray
+          \`\`\`
+          EOF
+          )
+            existing="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "\"$title\" in:title" --json number,title --jq ".[] | select(.title == \"$title\") | .number" | head -n1 || true)"
+            if [ -n "$existing" ]; then
+              gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body "$body" || true
+            else
+              gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body" || true
+            fi
+            exit 1
+          fi
+
+          workspace="$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')"
+          if [ "$workspace" != "$version" ]; then
+            echo "Merged workspace version '$workspace' does not match tag '$tag'"
+            exit 1
+          fi
+
+          # Best-effort push back to custom-tray (ignored if upstream modified .github/workflows/*,
+          # because build-windows performs the same merge in its workspace).
+          git push origin HEAD:custom-tray || true
+
+          echo "should_build=true" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  build-windows:
+    needs: check
+    if: needs.check.outputs.should_build == 'true'
+    runs-on: windows-2022
+    timeout-minutes: 150
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      BUILD_TAG: ${{ needs.check.outputs.tag }}
+      BUILD_VERSION: ${{ needs.check.outputs.version }}
+    steps:
+      - run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: custom-tray
+          fetch-depth: 0
+
+      - name: Merge upstream release tag
+        run: |
+          $tag = $env:BUILD_TAG
+          git fetch --no-tags https://github.com/zeronsh/zeron.git "refs/tags/${tag}:refs/tags/${tag}"
+          if ($LASTEXITCODE -ne 0) { throw "Failed to fetch $tag" }
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git merge --no-edit "refs/tags/$tag"
+          if ($LASTEXITCODE -ne 0) { throw "Merge $tag failed" }
+
+      - name: Rust toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Locate Windows SDK shader compiler
+        run: |
+          $fxc = Get-ChildItem "${env:ProgramFiles(x86)}/Windows Kits/10/bin/*/x64/fxc.exe" |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $fxc) { throw 'Windows SDK fxc.exe is required for GPUI release shaders' }
+          "GPUI_FXC_PATH=$($fxc.FullName)" >> $env:GITHUB_ENV
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: fork-win-zgx
+          workspaces: |
+            . -> target
+            apps/zgx -> target
+
+      - name: Build engine
+        env:
+          ZERON_ENGINE_VERSION: ${{ needs.check.outputs.version }}
+          LUAU_CXXFLAGS: -DNDEBUG
+        run: |
+          cargo build --release --locked -p zeron
+          if ($LASTEXITCODE -ne 0) { throw 'the engine failed to build' }
+          "ZGX_ENGINE=$((Resolve-Path -LiteralPath './target/release/zeron.exe').Path)" >> $env:GITHUB_ENV
+
+      - name: Package installer and portable zip
+        run: |
+          $feed = "https://github.com/$env:GITHUB_REPOSITORY/releases/latest/download"
+          ./scripts/package-windows.ps1 -ReleasesUrl $feed -ZgxVersion $env:BUILD_VERSION -ZgxEngine $env:ZGX_ENGINE
+
+      - name: Build and verify updater manifest
+        run: |
+          $ver = $env:BUILD_VERSION
+          $feed = "https://github.com/$env:GITHUB_REPOSITORY/releases/latest/download"
+          $stage = "target/package/zeron-$ver-windows-x86_64"
+          $updateCfg = (Get-Content -Raw -LiteralPath "$stage/zeron-update.json" | ConvertFrom-Json)
+          if ($updateCfg.releases_url -ne $feed) {
+            throw "Unexpected releases_url in zeron-update.json: $($updateCfg.releases_url)"
+          }
+
+          $artifacts = @(
+            "zeron-$ver-windows-x86_64.zip",
+            "zeron-$ver-windows-x86_64.exe",
+            "zeron-$ver-windows-x86_64-setup.exe"
+          )
+          $files = [ordered]@{}
+          foreach ($name in $artifacts) {
+            $path = Join-Path 'target/package' $name
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+              throw "Missing packaged artifact: $path"
+            }
+            $sha = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+            $files[$name] = @{ sha256 = $sha }
+          }
+
+          $manifestPath = 'target/package/manifest.json'
+          [ordered]@{
+            version = $ver
+            minimumMacOS = '13.0'
+            files = $files
+          } | ConvertTo-Json -Depth 4 | Set-Content -Encoding utf8NoBOM -LiteralPath $manifestPath
+
+          $parsed = Get-Content -Raw -LiteralPath $manifestPath | ConvertFrom-Json
+          $zipSha = $parsed.files."zeron-$ver-windows-x86_64.zip".sha256
+          if ($zipSha -notmatch '^[0-9a-f]{64}$') {
+            throw "Invalid zip sha256 in manifest.json: $zipSha"
+          }
+
+          [IO.File]::WriteAllText((Join-Path (Resolve-Path 'target/package').Path 'latest.txt'), $ver, [Text.UTF8Encoding]::new($false))
+          Get-ChildItem target/package -File | Select-Object Name, Length
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ver = $env:BUILD_VERSION
+          $tag = $env:BUILD_TAG
+          $assets = @(
+            "target/package/zeron-$ver-windows-x86_64.zip",
+            "target/package/zeron-$ver-windows-x86_64.exe",
+            "target/package/zeron-$ver-windows-x86_64-setup.exe",
+            "target/package/manifest.json",
+            "target/package/latest.txt"
+          )
+
+          gh release view $tag --repo $env:GITHUB_REPOSITORY 2>$null | Out-Null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag @assets --repo $env:GITHUB_REPOSITORY --clobber
+            if ($LASTEXITCODE -ne 0) { throw 'gh release upload failed' }
+            gh release edit $tag --repo $env:GITHUB_REPOSITORY --latest --prerelease=false
+            if ($LASTEXITCODE -ne 0) { throw 'gh release edit failed' }
+          } else {
+            $notes = @(
+              "Windows release for Zeron $ver with close-to-tray and tray context menu (Show / Quit)."
+              ""
+              "- Auto-update feed: ``https://github.com/$env:GITHUB_REPOSITORY/releases/latest/download``"
+              "- Upstream release: https://github.com/zeronsh/zeron/releases/tag/$tag"
+            ) -join "`n"
+            gh release create $tag @assets `
+              --repo $env:GITHUB_REPOSITORY `
+              --target custom-tray `
+              --latest `
+              --title "Zeron $ver (Windows Tray)" `
+              --notes $notes
+            if ($LASTEXITCODE -ne 0) { throw 'gh release create failed' }
+          }

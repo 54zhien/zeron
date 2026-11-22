@@ -30,6 +30,8 @@
 mod about;
 #[cfg(all(windows, feature = "beta"))]
 mod windows_install;
+#[cfg(windows)]
+mod windows_tray;
 mod acp_registry;
 mod agents;
 mod appshots;
@@ -352,6 +354,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         application = application
             .application_id("sh.zeron.app")?
             .on_application_event(|event, _| {
+                #[cfg(windows)]
+                windows_tray::show_main();
                 if let zgx_desktop::ApplicationEvent::OpenUrls(urls) = event {
                     for url in urls {
                         links::open(&url);
@@ -580,6 +584,8 @@ fn open_main(cx: &mut WindowContext, inspect: bool) {
     plugins::set_view(view);
     // Launch's allocator peak handed back once it has settled (src/heap.rs).
     heap::install(cx);
+    #[cfg(windows)]
+    windows_tray::install(cx);
 }
 
 /// Where finishing setup on this Mac is remembered: a launch signed in
@@ -719,7 +725,7 @@ fn script_host_at(cx: &mut WindowContext, path: PathBuf, entry: &str) -> ScriptH
     // glass's tint (ds/material).
     desktop_blur::install(cx, &host);
     let window = cx.window.clone();
-    host.action("close", move |_| window.close());
+    host.action("close", move |_| window.request_close());
     // Full screen, entered or left (`ui.invoke("window.full_screen", on)`),
     // as the green button does: macOS animates it, and `ui.window`'s
     // full_screen and its transition say so (a fixture drives the title
