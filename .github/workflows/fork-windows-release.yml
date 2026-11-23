@@ -164,10 +164,22 @@ jobs:
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          key: fork-win-zgx
+          key: fork-win-zgx-taffyfix
           workspaces: |
             . -> target
             apps/zgx -> target
+
+      - name: Patch zgx-taffy MinContent cache bug and verify
+        run: |
+          cargo fetch --locked --manifest-path apps/zgx/Cargo.toml
+          if ($LASTEXITCODE -ne 0) { throw 'cargo fetch for apps/zgx failed' }
+          ./scripts/patch-taffy-cache.ps1
+          ./scripts/patch-taffy-cache.ps1 -CheckOnly
+          Push-Location apps/zgx
+          try {
+            cargo test --locked --test table_grid_min_content_cache
+            if ($LASTEXITCODE -ne 0) { throw 'table_grid_min_content_cache regression test failed' }
+          } finally { Pop-Location }
 
       - name: Build engine
         env:
