@@ -99,6 +99,7 @@ export type Message = {
 	-- ("failed", to send again). The line under it says so at once, in its
 	-- reply's place.
 	waiting: ("sending" | "working" | "failed")?,
+	fail_reason: string?,
 	since: number?,
 	-- Its blocks laid out compact (Settings' compact transcript): its work
 	-- folded into one group, the reply it ends on shown.
@@ -539,7 +540,8 @@ local function waiting_line(row: State<Message>, on_retry: ((id: string) -> ())?
 	return ui.presence(function(): string?
 		local w = row:get().waiting
 		if w == "failed" then
-			return "failed"
+			local reason = row:get().fail_reason
+			return if reason and reason ~= "" then `failed:{reason}` else "failed"
 		end
 		local s = if w then said() else nil
 		return if s and s.step then "step" elseif s then "said" elseif w then "waiting" else nil
@@ -577,9 +579,15 @@ local function waiting_line(row: State<Message>, on_retry: ((id: string) -> ())?
 				},
 			}
 		end
-		if kind == "failed" then
+		if kind == "failed" or string.sub(kind, 1, 7) == "failed:" then
+			local reason = if string.sub(kind, 1, 7) == "failed:" then string.sub(kind, 8) else nil
+			local label = if reason == "too_large"
+				then locale.t("ds.transcript.not_delivered_too_large")
+				elseif reason == "offline" then locale.t("ds.transcript.not_delivered_offline")
+				elseif reason == "missing" then locale.t("ds.transcript.not_delivered_missing")
+				else locale.t("ds.transcript.not_delivered")
 			return ui.button {
-				label = locale.t("ds.transcript.not_delivered"),
+				label = label,
 				self = "start",
 				mt = "$space.4",
 				p = 0,
@@ -597,7 +605,7 @@ local function waiting_line(row: State<Message>, on_retry: ((id: string) -> ())?
 				end,
 				on_press = function() end,
 				on_release = function() end,
-				locale.t("ds.transcript.not_delivered"),
+				label,
 			}
 		end
 		return ui.row {

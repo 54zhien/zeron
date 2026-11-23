@@ -882,6 +882,8 @@ struct Pending {
     row: bool,
     /// The files the engine delivers for it, for a run sent again.
     transfers: Vec<Json>,
+    /// Why delivery failed ("too_large", "offline", "missing", etc.), when `waiting == "failed"`.
+    reason: Option<&'static str>,
 }
 
 impl Pending {
@@ -897,6 +899,7 @@ impl Pending {
             ("text", Value::from(words.as_str())),
             ("attachments", carried_value(&self.paths, &quotes, &picks, &comments, &chats)),
             ("waiting", Value::from(self.waiting)),
+            ("fail_reason", self.reason.map_or(Value::Nil, Value::from)),
             // Still in the engine's outbox, its files uploading: nothing has
             // gone to its chat yet (a Cloud machine isn't woken for it).
             ("held", Value::Bool(self.held)),
@@ -1307,6 +1310,7 @@ pub fn install(_cx: &mut WindowContext, host: &ScriptHost) {
             held: false,
             row: false,
             transfers: Vec::new(),
+            reason: None,
         });
     });
     let c = chats.clone();
@@ -3053,6 +3057,7 @@ impl View {
             held: false,
             row: false,
             transfers: Vec::new(),
+            reason: None,
         });
         drop(pending);
         if !fresh && !chats.running(&id) {
@@ -3145,7 +3150,7 @@ impl View {
                 }
                 Err(why) => {
                     // Failed before it could go: the prompt says so.
-                    self.mark_failed(&id, &message_id, None);
+                    self.mark_failed(&id, &message_id, None, Some(why));
                     return Err(why);
                 }
             }
@@ -3207,7 +3212,7 @@ impl View {
         // parent's.)
         if fresh && config["harness"].is_null() {
             eprintln!("zeron-zgx: chat: {id}: no agent to send with (the chat isn't known here yet)");
-            self.mark_failed(&id, &message_id, None);
+            self.mark_failed(&id, &message_id, None, Some("missing"));
             return Err("missing");
         }
         // A chat just made: its config goes out now, and its first message
@@ -3220,8 +3225,10 @@ impl View {
         // side chat takes its parent's): the engine refuses that switch
         // while a turn runs, and the message starts one. Then the config is
         // awaited first, and the message goes only once it has landed.
-        let set_config = fresh.then(|| json!({ "op": "setChatConfig", "chatId": id, "config": config }));
-        let switching = fresh && changes_agent(&chat["config"], &config);
+        let switching = changes_agent(&chat["config"], &config);
+        let send_config_first = fresh || (switching && !chats.running(&id));
+        let set_config = send_config_first
+            .then(|| json!({ "op": "setChatConfig", "chatId": id, "config": config }));
         let field = |key: &str| req.field(key).map(text).filter(|s| !s.is_empty());
         let cwd = field("cwd")
             .or_else(|| chat["cwd"].as_str().map(Into::into))
@@ -3252,21 +3259,28 @@ impl View {
                         // (It runs what its row says, then.)
                         chats.starting.borrow_mut().remove(&id);
                         chats.publish_views();
-                        self.mark_failed(&id, &message_id, None);
-                        return Err(engine::outcome(&e));
+                        let why = engine::outcome(&e);
+                        self.mark_failed(&id, &message_id, None, Some(why));
+                        return Err(why);
                     }
                 }
             }
             None => command_with(&id, run.clone(), &transfers).await,
         };
-        if sent.is_err() {
+        if let Err(why) = sent {
             // Not delivered: the prompt stays, failed, to send again.
             if let Some(pending) = self.pending.borrow_mut().get_mut(&id)
                 && let Some(p) = pending.iter_mut().find(|p| p.id == message_id)
             {
                 p.transfers = transfers;
             }
-            self.mark_failed(&id, &message_id, Some(run));
+            self.mark_failed(&id, &message_id, Some(run), Some(why));
+        } else if send_config_first && !fresh {
+            if let Some(c) = chats.chats.borrow_mut().get_mut(&id) {
+                c["config"] = config.clone();
+            }
+            chats.starting.borrow_mut().remove(&id);
+            chats.publish_views();
         } else if !fresh && runs_otherwise(&chat["config"], &config) {
             // Sent with another agent, model or effort than the chat had (the
             // composer's pick, kept as a draft until now): the chat takes
@@ -3340,6 +3354,7 @@ impl View {
                             held: true,
                             row,
                             transfers: Vec::new(),
+                            reason: None,
                         });
                         changed = true;
                     }
@@ -3353,12 +3368,13 @@ impl View {
 
     /// A pending prompt that didn't go: failed, with the command that sends
     /// it again (none: it never got that far, and is sent again whole).
-    fn mark_failed(&self, id: &str, message_id: &str, retry: Option<Json>) {
+    fn mark_failed(&self, id: &str, message_id: &str, retry: Option<Json>, reason: Option<&'static str>) {
         if let Some(pending) = self.pending.borrow_mut().get_mut(id)
             && let Some(p) = pending.iter_mut().find(|p| p.id == message_id)
         {
             p.waiting = "failed";
             p.retry = retry;
+            p.reason = reason;
         }
         self.publish_messages();
     }
@@ -3423,8 +3439,8 @@ impl View {
             return Err("failed");
         };
         let sent = command_with(&id, run.clone(), &transfers).await;
-        if sent.is_err() {
-            self.mark_failed(&id, &message_id, Some(run));
+        if let Err(why) = sent {
+            self.mark_failed(&id, &message_id, Some(run), Some(why));
         }
         self.publish_messages();
         sent
@@ -4009,9 +4025,8 @@ async fn command_with(chat: &str, command: Json, transfers: &[Json]) -> Result<(
 }
 
 /// A file uploaded to the device the chat runs on: its path there.
-/// The most a file attached may weigh (the shipping app's
-/// `MAX_ATTACHMENT_BYTES`).
-const MAX_ATTACHMENT_BYTES: u64 = 24 * 1024 * 1024;
+/// The most a file attached may weigh (raised to 512 MiB with streaming chunks).
+const MAX_ATTACHMENT_BYTES: u64 = 512 * 1024 * 1024;
 
 /// `work` on a thread of its own, its answer awaited here (None only if it
 /// panicked): a file read and encoded off the window's thread.
@@ -4082,9 +4097,12 @@ async fn upload_as(
     name: &str,
     target: Option<&str>,
 ) -> Result<String, Outcome> {
-    // Read and encoded off the window's thread, and no larger than the cap.
+    // Multiple of 3 raw bytes so each base64 chunk is `<= CHUNK` chars and
+    // concatenates without intermediate `=` padding (510_000 * 4 / 3 == 680_000).
+    const RAW_CHUNK: usize = (CHUNK / 4) * 3;
+
     let owned = path.to_owned();
-    let encoded = off_thread(move || -> Result<String, Outcome> {
+    let total_len = off_thread(move || -> Result<u64, Outcome> {
         let meta = std::fs::metadata(&owned).map_err(|_| "failed")?;
         if !meta.is_file() {
             return Err("failed");
@@ -4092,30 +4110,57 @@ async fn upload_as(
         if meta.len() > MAX_ATTACHMENT_BYTES {
             return Err("too_large");
         }
-        let bytes = std::fs::read(&owned).map_err(|_| "failed")?;
-        Ok(base64(&bytes))
+        Ok(meta.len())
     })
     .await
     .ok_or("failed")??;
+
     let routed = |mut p: Json| {
         if let Some(t) = target {
             p["targetDeviceId"] = json!(t);
         }
         p
     };
-    let mut seq = 0;
-    let mut at = 0;
-    while at < encoded.len() || seq == 0 {
-        let end = (at + CHUNK).min(encoded.len());
+
+    let mut seq = 0u64;
+    let mut offset = 0u64;
+    while offset < total_len || seq == 0 {
+        let owned = path.to_owned();
+        let want = (total_len.saturating_sub(offset)).min(RAW_CHUNK as u64) as usize;
+        let (encoded, read_len) = off_thread(move || -> Result<(String, usize), Outcome> {
+            use std::io::{Read, Seek};
+            if want == 0 {
+                return Ok((String::new(), 0));
+            }
+            let mut file = std::fs::File::open(&owned).map_err(|_| "failed")?;
+            file.seek(std::io::SeekFrom::Start(offset)).map_err(|_| "failed")?;
+            let mut buf = vec![0u8; want];
+            let mut filled = 0usize;
+            while filled < want {
+                let n = file.read(&mut buf[filled..]).map_err(|_| "failed")?;
+                if n == 0 {
+                    break;
+                }
+                filled += n;
+            }
+            buf.truncate(filled);
+            Ok((base64(&buf), filled))
+        })
+        .await
+        .ok_or("failed")??;
+
         engine::get()
             .call(
                 "UploadChunk",
-                routed(json!({ "uploadId": upload_id, "seq": seq, "data": &encoded[at..end] })),
+                routed(json!({ "uploadId": upload_id, "seq": seq, "data": encoded })),
             )
             .await
             .map_err(|e| engine::outcome(&e))?;
         seq += 1;
-        at = end;
+        offset += read_len as u64;
+        if read_len == 0 {
+            break;
+        }
     }
     let file_name = base_name(name);
     let committed = engine::get()
@@ -9371,6 +9416,7 @@ mod tests {
                 held: false,
                 row: false,
                 transfers: Vec::new(),
+                reason: None,
             }],
         );
         let ids = || -> Vec<String> {

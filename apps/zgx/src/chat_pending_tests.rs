@@ -130,12 +130,13 @@ fn a_send_that_fails_while_away_keeps_its_prompt_and_retry() {
     let (_app, view, _sending) = pending_chat();
     view.open_chat(Some("other-chat".into()));
     let run = json!({ "kind": "run", "messageId": "first-message", "request": { "prompt": "Find the startup bug" } });
-    view.mark_failed("new-chat", "first-message", Some(run.clone()));
+    view.mark_failed("new-chat", "first-message", Some(run.clone()), Some("offline"));
     assert_eq!(messages(&view), json!([]));
 
     view.open_chat(Some("new-chat".into()));
     view.heard_frame(json!({ "reset": [] }));
     assert_eq!(messages(&view)[0]["waiting"], "failed");
+    assert_eq!(messages(&view)[0]["fail_reason"], "offline");
     assert_eq!(view.pending.borrow()["new-chat"][0].retry, Some(run));
 
     let mut retry = Box::pin(view.retry(Value::record([

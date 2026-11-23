@@ -142,8 +142,8 @@ fn is_upload_name(name: &str) -> bool {
         && sanitize(name) == name
 }
 
-/// Hard cap on an assembled file.
-const MAX_BYTES: u64 = 32 * 1024 * 1024;
+/// Hard cap on an assembled file (raised to 512 MiB with streaming commit).
+const MAX_BYTES: u64 = 512 * 1024 * 1024;
 /// Multiple of 3 so independent base64 chunks concatenate losslessly.
 const READ_CHUNK_BYTES: u64 = 45_000;
 
@@ -168,6 +168,9 @@ struct UploadsInner {
     /// them. RwLock: a local-profile import adds its source root at runtime so
     /// imported transcripts resolve without an engine restart.
     read_only_roots: std::sync::RwLock<Vec<PathBuf>>,
+    /// Per-upload staged chunk byte sizes (`upload_id -> (seq -> len)`) so
+    /// large multi-hundred-chunk uploads stay O(1) instead of O(N^2) stat scans.
+    staged_sizes: std::sync::Mutex<std::collections::HashMap<String, std::collections::HashMap<u64, u64>>>,
 }
 
 #[derive(Clone)]
@@ -198,6 +201,7 @@ impl Uploads {
                         .map(Path::to_path_buf)
                         .collect(),
                 ),
+                staged_sizes: std::sync::Mutex::new(std::collections::HashMap::new()),
             }),
         }
     }
@@ -236,50 +240,144 @@ impl Uploads {
             return Err(EngineError::Other("Invalid chunk index".into()));
         }
         // Base64 inflates by ~4/3; bound the staged payload against the file cap.
-        let staged: u64 = chunk_files(&dir)?
-            .iter()
-            .filter(|(seq, _)| *seq != at)
-            .map(|(_, path)| std::fs::metadata(path).map(|m| m.len()).unwrap_or(0))
-            .sum();
+        let staged: u64 = {
+            let mut sizes = self
+                .inner
+                .staged_sizes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let entry = match sizes.entry(upload_id.to_owned()) {
+                std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    let mut initial = std::collections::HashMap::new();
+                    for (seq, path) in chunk_files(&dir)? {
+                        let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+                        initial.insert(seq, len);
+                    }
+                    v.insert(initial)
+                }
+            };
+            entry
+                .iter()
+                .filter(|(seq, _)| **seq != at)
+                .map(|(_, len)| *len)
+                .sum()
+        };
         if (staged + data.len() as u64) * 3 / 4 > MAX_BYTES {
             let _ = std::fs::remove_dir_all(&dir);
+            self.inner
+                .staged_sizes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(upload_id);
             return Err(EngineError::Other("Upload too large".into()));
         }
         std::fs::write(dir.join(format!("{at:06}.b64")), data)?;
+        self.inner
+            .staged_sizes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(upload_id.to_owned())
+            .or_default()
+            .insert(at, data.len() as u64);
         Ok(())
     }
 
-    /// Assemble the staged chunks into a durable file and return its absolute
-    /// path.
+    /// Assemble the staged chunks into a durable file (streaming chunk-by-chunk
+    /// to keep memory bounded) and return its absolute path.
     pub fn commit(&self, upload_id: &str, file_name: &str) -> Result<String, EngineError> {
+        use std::io::Write;
         let dir = self.staging_dir(upload_id)?;
         let mut parts = chunk_files(&dir)?;
         if parts.is_empty() {
             return Err(EngineError::Other("Unknown or expired upload".into()));
         }
         parts.sort_by_key(|(seq, _)| *seq);
-        // Positional appends may leave holes if a chunk never arrived — joining
-        // around them would silently corrupt the file.
-        let mut joined = String::new();
-        for (i, (seq, path)) in parts.iter().enumerate() {
+        for (i, (seq, _)) in parts.iter().enumerate() {
             if *seq != i as u64 {
                 return Err(EngineError::Other("Upload is missing a chunk".into()));
             }
-            joined.push_str(std::fs::read_to_string(path)?.trim());
         }
-        let bytes = BASE64
-            .decode(joined.as_bytes())
-            .map_err(|e| EngineError::Other(format!("upload is not valid base64: {e}")))?;
-        if bytes.len() as u64 > MAX_BYTES {
-            let _ = std::fs::remove_dir_all(&dir);
-            return Err(EngineError::Other("Upload too large".into()));
-        }
+
         std::fs::create_dir_all(&self.inner.dir)?;
+        std::fs::create_dir_all(&self.inner.tmp)?;
         let name = sanitize(file_name);
         let id8: String = upload_id.chars().take(8).collect();
         let path = self.inner.dir.join(format!("{id8}-{name}"));
-        std::fs::write(&path, &bytes)?;
+        let part_path = self.inner.tmp.join(format!("{upload_id}.assembling"));
+
+        let mut writer = std::io::BufWriter::new(std::fs::File::create(&part_path)?);
+        let mut carry = Vec::<u8>::new();
+        let mut total_bytes: u64 = 0;
+
+        let result: Result<(), EngineError> = (|| {
+            for (_, chunk_path) in &parts {
+                let raw = std::fs::read_to_string(chunk_path)?;
+                let trimmed = raw.trim().as_bytes();
+                let mut combined;
+                let slice: &[u8] = if carry.is_empty() {
+                    trimmed
+                } else {
+                    combined = Vec::with_capacity(carry.len() + trimmed.len());
+                    combined.extend_from_slice(&carry);
+                    combined.extend_from_slice(trimmed);
+                    carry.clear();
+                    &combined
+                };
+                let full_len = (slice.len() / 4) * 4;
+                if full_len > 0 {
+                    let decoded = BASE64
+                        .decode(&slice[..full_len])
+                        .map_err(|e| EngineError::Other(format!("upload is not valid base64: {e}")))?;
+                    total_bytes += decoded.len() as u64;
+                    if total_bytes > MAX_BYTES {
+                        return Err(EngineError::Other("Upload too large".into()));
+                    }
+                    writer.write_all(&decoded)?;
+                }
+                if full_len < slice.len() {
+                    carry.extend_from_slice(&slice[full_len..]);
+                }
+            }
+            if !carry.is_empty() {
+                let decoded = BASE64
+                    .decode(&carry)
+                    .map_err(|e| EngineError::Other(format!("upload is not valid base64: {e}")))?;
+                total_bytes += decoded.len() as u64;
+                if total_bytes > MAX_BYTES {
+                    return Err(EngineError::Other("Upload too large".into()));
+                }
+                writer.write_all(&decoded)?;
+            }
+            writer.flush()?;
+            Ok(())
+        })();
+
+        drop(writer);
+        if let Err(err) = result {
+            let _ = std::fs::remove_file(&part_path);
+            if matches!(&err, EngineError::Other(msg) if msg == "Upload too large") {
+                let _ = std::fs::remove_dir_all(&dir);
+                self.inner
+                    .staged_sizes
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(upload_id);
+            }
+            return Err(err);
+        }
+
+        // On Windows, `rename` fails if the destination already exists.
+        if path.exists() {
+            let _ = std::fs::remove_file(&path);
+        }
+        std::fs::rename(&part_path, &path)?;
         let _ = std::fs::remove_dir_all(&dir);
+        self.inner
+            .staged_sizes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(upload_id);
         Ok(path.to_string_lossy().to_string())
     }
 
@@ -439,6 +537,13 @@ impl Uploads {
             };
             if expired {
                 let _ = std::fs::remove_dir_all(entry.path());
+                if let Some(name) = entry.file_name().to_str() {
+                    self.inner
+                        .staged_sizes
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .remove(name);
+                }
             }
         }
     }
