@@ -431,6 +431,7 @@ impl Engine {
 
         let restart_stop = stop_tx.clone();
         let stopped_for_update = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let shutting_down = Arc::new(std::sync::atomic::AtomicBool::new(false));
         // macOS: the new version is only ever started by the app (see
         // `app_starts_engine`), so the restart waits for the app to run and
         // this engine keeps serving the old version until then.
@@ -441,6 +442,7 @@ impl Engine {
             || std::env::current_exe().ok(),
             restart_stop,
             stopped_for_update.clone(),
+            shutting_down.clone(),
         ));
         let uninstalled_stop = stop_tx.clone();
         // Signed in with no organization chosen, there's no profile to open
@@ -493,6 +495,7 @@ impl Engine {
                 }
             } => Err(anyhow::anyhow!("engine assembly failed: {failure}")),
         };
+        shutting_down.store(true, std::sync::atomic::Ordering::SeqCst);
         tracing::info!("background engine shutting down");
         server.abort();
         boot.abort();
@@ -559,9 +562,16 @@ fn managed_restart(
     exe: impl Fn() -> Option<PathBuf> + Send + Sync + 'static,
     stop: tokio::sync::mpsc::UnboundedSender<()>,
     stopped_for_update: Arc<std::sync::atomic::AtomicBool>,
+    shutting_down: Arc<std::sync::atomic::AtomicBool>,
 ) -> impl Fn() -> anyhow::Result<()> + Send + Sync + 'static {
     use zeron_update::transaction;
     move || {
+        // Never relaunch a new engine if this process is already shutting down
+        // (e.g. tray quit followed immediately by `about::install_on_quit`).
+        if shutting_down.load(std::sync::atomic::Ordering::SeqCst) {
+            tracing::info!("ignoring superseded restart while engine is shutting down");
+            return Ok(());
+        }
         if cfg!(target_os = "macos") {
             if transaction::read(&data_dir).is_some_and(|update| update.in_progress()) {
                 let exe = exe();
@@ -766,9 +776,15 @@ mod tests {
         fn restart_from(&self, exe: &Path) -> (bool, bool, bool) {
             let (stop, mut stopped) = tokio::sync::mpsc::unbounded_channel();
             let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let shutting_down = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let exe = exe.to_path_buf();
-            let restart =
-                managed_restart(self.data.clone(), move || Some(exe.clone()), stop, flag.clone());
+            let restart = managed_restart(
+                self.data.clone(),
+                move || Some(exe.clone()),
+                stop,
+                flag.clone(),
+                shutting_down,
+            );
             let went_ahead = restart().is_ok();
             (
                 went_ahead,
@@ -776,6 +792,24 @@ mod tests {
                 flag.load(std::sync::atomic::Ordering::SeqCst),
             )
         }
+    }
+
+    #[test]
+    fn managed_restart_is_ignored_once_shutting_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let (stop, mut stopped) = tokio::sync::mpsc::unbounded_channel();
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let shutting_down = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let restart = managed_restart(
+            dir.path().to_path_buf(),
+            || None,
+            stop,
+            flag.clone(),
+            shutting_down,
+        );
+        assert!(restart().is_ok());
+        assert!(stopped.try_recv().is_err(), "no stop signal or relaunch while shutting down");
+        assert!(!flag.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     /// The app installed a newer bundle itself ("Restart to update",

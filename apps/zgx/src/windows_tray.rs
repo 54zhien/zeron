@@ -306,13 +306,15 @@ pub fn stop_engine() {
         }
         return;
     }
-    // `StopEngine` replies first, then waits 500 ms before triggering shutdown.
-    let deadline = Instant::now() + Duration::from_secs(3);
+    // `StopEngine` replies first, then triggers shutdown after 500 ms. Wait
+    // until both the IPC port closes and `engine.lock` is released so
+    // `about::install_on_quit()` cannot race with a still-exiting engine.
+    let deadline = Instant::now() + Duration::from_secs(10);
     std::thread::sleep(Duration::from_millis(550));
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     while Instant::now() < deadline {
-        if TcpStream::connect_timeout(&addr, Duration::from_millis(50)).is_err() {
-            std::thread::sleep(Duration::from_millis(150));
+        let port_closed = TcpStream::connect_timeout(&addr, Duration::from_millis(50)).is_err();
+        if port_closed && !zeron_launch::data_dir_held(&data_dir) {
             break;
         }
         std::thread::sleep(Duration::from_millis(100));
