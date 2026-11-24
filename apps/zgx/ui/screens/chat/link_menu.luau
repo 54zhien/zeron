@@ -16,7 +16,14 @@ local sessions = require("@account/sessions")
 local files = require("@app/screens/files/api")
 
 local function base_name(path: string): string
-	return string.match(path, "([^/]+)/?$") or path
+	return string.match(path, "([^/\\]+)[/\\]?$") or path
+end
+
+local function native_path(path: string, cwd: string?): string
+	if (cwd and string.find(cwd, "\\", 1, true)) or string.match(path, "^%a:/") then
+		return (string.gsub(path, "/", "\\"))
+	end
+	return path
 end
 
 return function(open: (target: string) -> (), session: () -> any?): (target: string) -> { Links.Entry }?
@@ -49,9 +56,10 @@ return function(open: (target: string) -> (), session: () -> any?): (target: str
 		end
 		local path = r.path
 		if r.outside then
-			return Links.file { path = path }
+			return Links.file { path = native_path(path, cwd) }
 		end
 		local here = s ~= nil and (s.device == nil or s.device == sessions.now:peek().here)
+		local full = if cwd then `{(string.gsub(cwd, "[/\\]+$", ""))}/{path}` else path
 		return Links.file {
 			open = function()
 				open(target)
@@ -63,7 +71,7 @@ return function(open: (target: string) -> (), session: () -> any?): (target: str
 					end)
 				end
 				else nil,
-			path = if cwd then `{(string.gsub(cwd, "/+$", ""))}/{path}` else path,
+			path = native_path(full, cwd),
 		}
 	end
 end

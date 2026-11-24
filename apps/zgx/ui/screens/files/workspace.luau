@@ -801,6 +801,10 @@ function M.open(v: View, path: string?)
 		return
 	end
 	local id = w.model.by_path[path]
+	if id and w.model.nodes[id].kind == "dir" then
+		v.reveal:set(path)
+		return
+	end
 	local size = if id then w.model.nodes[id].size else nil
 	v.doc:set({ path = path, state = "loading", size = size, absolute = absolute(w, path) })
 	-- (One being made opens once it is.)
@@ -816,6 +820,11 @@ function M.open(v: View, path: string?)
 			return
 		end
 		local m = string.lower(message(err))
+		if string.find(m, "directory", 1, true) ~= nil or string.find(m, "is a dir", 1, true) ~= nil then
+			v.doc:set(nil)
+			v.reveal:set(path)
+			return
+		end
 		local gone = string.find(m, "not found", 1, true) ~= nil or string.find(m, "no such", 1, true) ~= nil
 		v.doc:set({
 			path = path,

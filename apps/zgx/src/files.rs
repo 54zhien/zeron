@@ -1247,8 +1247,26 @@ pub(crate) fn spawn_reaped(command: &mut std::process::Command) -> std::io::Resu
     Ok(pid)
 }
 
+#[cfg(target_os = "windows")]
+fn reveal_in_finder(path: &Path) -> std::io::Result<()> {
+    // Strip the `\\?\` verbatim prefix from `canonicalize()`, which `explorer.exe /select,` rejects.
+    let display = path.to_string_lossy();
+    let clean = if let Some(unc) = display.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{unc}")
+    } else {
+        display.strip_prefix(r"\\?\").unwrap_or(&display).to_owned()
+    };
+    let mut cmd = std::process::Command::new("explorer.exe");
+    if path.is_dir() {
+        cmd.arg(&clean);
+    } else {
+        cmd.arg(format!("/select,{clean}"));
+    }
+    cmd.spawn().map(|_| ())
+}
+
 /// Elsewhere: its folder, opened.
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn reveal_in_finder(path: &Path) -> std::io::Result<()> {
     open::that_detached(path.parent().unwrap_or(path))
 }

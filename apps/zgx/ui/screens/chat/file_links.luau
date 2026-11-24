@@ -193,16 +193,25 @@ local function suffix(target: string): (string | false, number?, number?, number
 	return before, n, nil, nil
 end
 
+local function is_windows_abs(path: string): boolean
+	return string.match(path, "^%a:/") ~= nil
+end
+
 -- `path` inside `root`: its relative rest, or nil.
 local function inside(path: string, root: string?): string?
 	if not root or root == "" then
 		return nil
 	end
-	local r = string.gsub(root, "/+$", "")
-	if string.sub(path, 1, #r + 1) ~= r .. "/" then
+	local r = string.gsub(string.gsub(root, "\\", "/"), "/+$", "")
+	local prefix = r .. "/"
+	if is_windows_abs(path) and is_windows_abs(prefix) then
+		if string.lower(string.sub(path, 1, #prefix)) ~= string.lower(prefix) then
+			return nil
+		end
+	elseif string.sub(path, 1, #prefix) ~= prefix then
 		return nil
 	end
-	local rest = string.sub(path, #r + 2)
+	local rest = string.sub(path, #prefix + 1)
 	return if rest ~= "" then rest else nil
 end
 
@@ -233,9 +242,15 @@ function M.resolve(target: string, root: string?): Resolved?
 		if string.sub(rest, 1, 1) ~= "/" or string.find(rest, "?", 1, true) then
 			return nil
 		end
+		-- Windows file URLs (`file:///D:/...`) carry a leading `/` before the drive letter.
+		if string.match(rest, "^/%a:/") then
+			rest = string.sub(rest, 2)
+		end
 		raw = rest
 	elseif string.find(target, "://", 1, true) or string.sub(target, 1, 7) == "mailto:" then
 		return nil
+	elseif string.match(target, "^%a:[\\/]") then
+		raw = (string.gsub(target, "\\", "/"))
 	end
 	local p1, line1, column1, end1 = fragment(raw)
 	if not p1 then
@@ -251,7 +266,7 @@ function M.resolve(target: string, root: string?): Resolved?
 	end
 	local line, column = line1 or line2, column1 or column2
 	local end_line = if line1 then end1 else end2
-	if string.sub(path, 1, 1) == "/" then
+	if string.sub(path, 1, 1) == "/" or is_windows_abs(path) then
 		if #path == 1 or string.sub(path, 1, 2) == "//" or string.sub(path, -1) == "/" or (not file_url and not string.find(file_name(path), ".", 1, true)) then
 			return nil
 		end
